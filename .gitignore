@@ -1,0 +1,9 @@
+weights/
+*.onnx
+*.png
+*.pth
+
+#runs folder
+runs/
+__pycache__/
+*.pyc

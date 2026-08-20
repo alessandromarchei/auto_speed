@@ -83,7 +83,7 @@ class AutoSpeedSingleRunTrainingArgs(AutoSpeedTrainingArgs):
     """
     Parameters for a single-run training call only (not HPO).
     """
-    config: Tuple[Path, ...] = (Path("../config/auto_speed.yaml"),)
+    config: Tuple[Path, ...] = (Path("Models/config/auto_speed.yaml"),)
     """Config YAML specifying hyperparameters for the model"""
     profile: bool = False
     """Print model parameter count and FLOPs before training"""

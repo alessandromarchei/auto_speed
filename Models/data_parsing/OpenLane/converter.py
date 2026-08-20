@@ -26,6 +26,39 @@ def resample():
     )
     return random.choice(seq=choices)
 
+def process_single_image(file, input_dir, output_dir):
+    file = Path(file)
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+
+    try:
+        with Image.open(file) as img:
+            width, height = img.size
+
+            # Crop da 1920x1280 a 1920x960
+            cropped = img.crop((0, 320, width, height))
+
+            # Resize a 1024x512
+            resized = cropped.resize(
+                (new_image_width, new_image_height),
+                Image.Resampling.LANCZOS,
+            )
+
+            # Mantieni un nome globalmente univoco usando segmento + frame.
+            relative = file.relative_to(input_dir)
+            segment_name = relative.parent.name
+
+            target_name = f"{segment_name}__{file.name}"
+            target = output_dir / target_name
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            resized.save(target)
+
+        return None
+
+    except Exception as e:
+        return f"Failed to process {file}: {e}"
+
 
 def decode_and_resize(filename: Path, input_width: int, input_height: int, augment: bool = True):
     data = cv2.imread(filename.as_posix())
@@ -102,40 +135,42 @@ def move_images(input_dir, output_dir):
         shutil.rmtree(input_dir)
 
 
-def process_images(input_dir, output_dir):
+def process_images(input_dir, output_dir, workers=2):
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
 
-    files = [f for f in input_dir.rglob("*") if f.is_file()]
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    for file in tqdm(files, desc="Cropping files", unit="file"):
-        try:
-            with Image.open(file) as img:
-                width, height = img.size
-                # Crop: (left, upper, right, lower)
-                cropped = img.crop((0, 320, width, height))
-                # Resize
-                resized = cropped.resize((new_image_width, new_image_height), Image.LANCZOS)
+    files = [
+        f for f in input_dir.rglob("*")
+        if f.is_file()
+    ]
 
-                # Save to output directory
-                target = output_dir / file.name
-                target.parent.mkdir(parents=True, exist_ok=True)
+    worker = partial(
+        process_single_image,
+        input_dir=input_dir,
+        output_dir=output_dir,
+    )
 
-                # If file with same name exists, rename
-                if target.exists():
-                    print(f"File with same name already exists: {target}")
-                    # optional: add suffix
-                    stem, ext = file.stem, file.suffix
-                    target = output_dir / f"{stem}_cropped{ext}"
+    with Pool(processes=workers) as pool:
+        results = list(
+            tqdm(
+                pool.imap_unordered(worker, files, chunksize=16),
+                total=len(files),
+                desc="Cropping images",
+                unit="file",
+            )
+        )
 
-                resized.save(target)
+    errors = [result for result in results if result is not None]
 
-        except Exception as e:
-            print(f"Failed to process {file}: {e}")
+    for error in errors:
+        print(error)
 
-    # Optionally, delete the original input directory
-    if input_dir.exists() and input_dir.is_dir():
-        shutil.rmtree(input_dir)
+    print(
+        f"Processed {len(files) - len(errors)}/{len(files)} images. "
+        f"Errors: {len(errors)}"
+    )
 
 
 def convert_labels(input_dir, output_dir):
@@ -147,7 +182,10 @@ def convert_labels(input_dir, output_dir):
     new_height = orig_image_height - crop_top
 
     for file in tqdm(files, desc="Convert labels", unit="file"):
-        base_name = file.name.split(".", 1)[0]
+        relative = file.relative_to(input_dir)
+        segment_name = relative.parent.name
+        base_name = f"{segment_name}__{Path(file.stem).stem}"   
+        
         with file.open("r", encoding="utf-8") as f:
             data = json.load(f)
             labels = []
@@ -181,9 +219,9 @@ def convert_labels(input_dir, output_dir):
             for item in labels:
                 f.write(" ".join(map(str, item)) + "\n")
 
-        file.unlink()
+        # file.unlink()
 
-    shutil.rmtree(input_dir)
+    # shutil.rmtree(input_dir)
 
 
 def convert_lane3d_labels(input_dir, output_dir):
@@ -291,32 +329,26 @@ def expand_training_set_and_split_for_hpo(dataset_dir, fract=0.25, val_fraction=
     print(f"HPO validation set in\n- {val_hpo_images_dir}\n- {val_hpo_labels_dir}")
 
 
-def convert(input_ds_dir, output_ds_dir):
-    # convert training data
-    input_training_dir = input_ds_dir + "/images/training"
-    output_training_dir = output_ds_dir + "/images/train"
-    process_images(input_training_dir, output_training_dir)
+def convert(input_ds_dir, output_ds_dir, workers=2):
+    # Training images
+    input_dir = input_ds_dir + "/images/training"
+    output_dir = output_ds_dir + "/images/train"
+    process_images(input_dir, output_dir, workers=workers)
 
-    input_dir = input_ds_dir + "/labels/training"
+    # Training CIPO labels
+    input_dir = input_ds_dir + "/cipo/cipo/training"
     output_dir = output_ds_dir + "/labels/train"
     convert_labels(input_dir, output_dir)
 
-    # input_dir = dataset_dir + "/labels_lane3d/training"
-    # output_dir = dataset_dir + "/labels_lane3d/train"
-    # convert_lane3d_labels(input_dir, output_dir)
-
-    # convert validation data
+    # Validation images
     input_dir = input_ds_dir + "/images/validation"
     output_dir = output_ds_dir + "/images/val"
-    process_images(input_dir, output_dir)
+    process_images(input_dir, output_dir, workers=workers)
 
-    input_dir = input_ds_dir + "/labels/validation"
+    # Validation CIPO labels
+    input_dir = input_ds_dir + "/cipo/cipo/validation"
     output_dir = output_ds_dir + "/labels/val"
     convert_labels(input_dir, output_dir)
-
-    # input_dir = dataset_dir + "/labels_lane3d/validation"
-    # output_dir = dataset_dir + "/labels_lane3d/val"
-    # convert_lane3d_labels(input_dir, output_dir)
 
 
 if __name__ == '__main__':
@@ -346,12 +378,18 @@ if __name__ == '__main__':
         default=16,
         help="Number of worker processes to use when exporting .npy arrays",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help="Number of worker processes to use when processing images",
+    )
     args = parser.parse_args()
 
     input_ds_dir = args.input_ds_dir
     output_ds_dir = args.output_ds_dir
 
-    convert(input_ds_dir, output_ds_dir)
+    convert(input_ds_dir, output_ds_dir, workers=args.workers)
     
     expand_training_set_and_split_for_hpo(output_ds_dir)
 
