@@ -5,7 +5,7 @@ from Models.model_components.auto_speed.auto_speed_backbone import AutoSpeedBack
 from Models.model_components.auto_speed.auto_speed_neck import AutoSpeedNeck
 from Models.model_components.auto_speed.auto_speed_head import AutoSpeedHead
 from Models.model_components.common_layers import Conv
-from Models.model_components.auto_steer.backbones import TimmFeatureEncoder
+from Models.model_components.auto_speed.backbones import TimmFeatureEncoder
 import onnx
 import onnxsim
 import pathlib
@@ -122,21 +122,11 @@ class AutoSpeedNetwork:
             },
         }
 
-    def build_model(
-        self,
-        version,
-        encoder_name=None,
-        encoder_pretrained=False,
-    ):
-        config = self.dynamic_weighting[version]
-
-        return YOLO(
-            width=config['width'],
-            depth=config['depth'],
-            csp=config['csp'],
-            encoder_name=encoder_name,
-            encoder_pretrained=encoder_pretrained,
-        )
+    def build_model(self, version, num_classes, encoder_name=None, encoder_pretrained=False):
+        csp = self.dynamic_weighting[version]['csp']
+        depth = self.dynamic_weighting[version]['depth']
+        width = self.dynamic_weighting[version]['width']
+        return YOLO(width, depth, csp, num_classes, encoder_name=encoder_name, encoder_pretrained=encoder_pretrained)
 
     def load_model(
         self,
@@ -222,7 +212,7 @@ class AutoSpeedNetwork:
                 opset_version=13,
                 do_constant_folding=True,
                 input_names=["input"],
-                output_names=["lane_value", "height"],
+                output_names=["output"],
                 dynamic_axes=None,
                 training=torch.onnx.TrainingMode.EVAL,
                 external_data=False,

@@ -127,4 +127,7 @@ class TimmFeatureEncoder(torch.nn.Module):
             )
         ]
 
+        #return the latest 3 features for the neck
+        adapted_features = adapted_features[-3:]
+
         return adapted_features

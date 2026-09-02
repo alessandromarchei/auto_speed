@@ -185,9 +185,18 @@ def train(
         logger.write_log("CUDA not available. Using CPU.")
 
     if args.checkpoint_path:
-        model = AutoSpeedNetwork().load_model(version=args.version, num_classes=4, checkpoint_path=args.checkpoint_path)
+        model = AutoSpeedNetwork().load_model(version=args.version,
+            num_classes=4,
+            checkpoint_path=args.checkpoint_path,
+            encoder_name=args.encoder_name if args.encoder_name else params.get('encoder_name', None),
+            encoder_pretrained=args.encoder_pretrained if args.encoder_name else params.get('encoder_pretrained', False)
+        )   
     else:
-        model = AutoSpeedNetwork().build_model(version=args.version, num_classes=4)
+        model = AutoSpeedNetwork().build_model(version=args.version,
+            num_classes=4,
+            encoder_name=args.encoder_name if args.encoder_name else params.get('encoder_name', None),
+            encoder_pretrained=args.encoder_pretrained if args.encoder_name else params.get('encoder_pretrained', False)
+        )
     model.cuda()
 
     # Optimizer
@@ -579,7 +588,14 @@ def profile(args: AutoSpeedTrainingArgs, params):
     shape = (1, 3, args.input_height, args.input_width)
 
     net_builder = AutoSpeedNetwork()
-    model = net_builder.build_model(version=args.version, num_classes=4)
+
+    model = net_builder.build_model(version=args.version,
+        num_classes=4,
+        encoder_name=args.encoder_name if args.encoder_name else params.get('encoder_name', None),
+        encoder_pretrained=args.encoder_pretrained if args.encoder_name else params.get('encoder_pretrained', False)
+    )
+
+
     model.eval()
     model(torch.zeros(shape))
 
@@ -650,4 +666,32 @@ if __name__ == "__main__":
     weights_dir = run_dir / "weights"
     weights_dir.mkdir(parents=True, exist_ok=False)
     log_writer = SummaryWriter(log_dir=str(run_dir))
-    
+
+    print(f"Experiment name: {args.expname}")
+    print(f"Experiment directory: {run_dir}")
+
+    if args.distributed:
+        torch.cuda.set_device(device=args.local_rank)
+        torch.distributed.init_process_group(backend='nccl', init_method='env://')
+
+    if args.local_rank == 0:
+        weights_dir.mkdir(exist_ok=True, parents=True)
+
+    # Load the hyperparameters we will pass to model training
+    params = {}
+    for config_path in args.config:
+        print(f"Loading config from {config_path}")
+        with config_path.open("r", errors="ignore") as f:
+            params.update(yaml.safe_load(f))
+
+    util.setup_seed()
+    util.setup_multi_processes()
+
+    if args.profile:
+        profile(args, params)
+    train(args, params, run_dir, log_writer)
+
+    # Clean
+    if args.distributed:
+        torch.distributed.destroy_process_group()
+    torch.cuda.empty_cache()
