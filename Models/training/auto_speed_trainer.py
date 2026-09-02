@@ -1,7 +1,5 @@
-import contextlib
 import os
 import copy
-import shutil
 import warnings
 import tyro
 import torch
@@ -55,6 +53,19 @@ class AutoSpeedTrainingArgs:
     warmup_epochs: int = 1
     """ Number of epochs to skip from throughput metrics"""
     do_compile: bool = False
+    """Backward-compatible alias for --torch-compile."""
+    torch_compile: bool = False
+    """Enable torch.compile for the training model."""
+
+    expname: str = "run"
+    """Name of the experiment for saving runs."""
+
+    encoder_name: Optional[str] = None
+    """Name of the encoder backbone to use (e.g., 'efficientnet_lite0'). If None, no encoder is used."""
+
+    encoder_pretrained: bool = False
+    """Whether to use pretrained weights for the encoder backbone."""
+
     compile_backend: str = "inductor"
     compile_mode: str = "default"
     compile_dynamic: bool = False
@@ -65,6 +76,13 @@ class AutoSpeedTrainingArgs:
     fp16 and using automatic mixed precision with gradient scaling. Increases memory usage, but
     can in some circumstances improve performance.
     """
+    bf16: bool = False
+    """
+    Use CUDA automatic mixed precision with bfloat16. When both --fp32 and
+    --bf16 are false, the original fp16 AMP behaviour is used.
+    """
+    tf32: bool = False
+    """Enable TF32 for CUDA float32 matrix multiplications and cuDNN."""
     disable_vectorized_loss: bool = False
     """
     Use the original implementation of building the GT tensor for
@@ -74,8 +92,39 @@ class AutoSpeedTrainingArgs:
     checkpoint_path: Optional[str] = None
 
     def __post_init__(self):
+        if self.fp32 and self.bf16:
+            raise ValueError("--fp32 and --bf16 are mutually exclusive")
         self.distributed: bool = self.world_size > 1
         self.runs_dir = self.runs_dir.absolute()
+
+
+def configure_cuda_precision(args: AutoSpeedTrainingArgs) -> None:
+    """Configure process-wide CUDA math without changing stored model weights."""
+    if not torch.cuda.is_available():
+        return
+
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32
+    torch.backends.cudnn.allow_tf32 = args.tf32
+    torch.set_float32_matmul_precision("high" if args.tf32 else "highest")
+
+    if args.bf16 and not torch.cuda.is_bf16_supported():
+        raise RuntimeError(
+            "--bf16 was requested, but the active CUDA device does not "
+            "support bfloat16 training"
+        )
+
+
+def amp_dtype(args: AutoSpeedTrainingArgs):
+    if args.fp32:
+        return None
+    return torch.bfloat16 if args.bf16 else torch.float16
+
+
+def autocast_context(args: AutoSpeedTrainingArgs):
+    dtype = amp_dtype(args)
+    if dtype is None:
+        return nullcontext()
+    return torch.amp.autocast(device_type="cuda", dtype=dtype)
 
 
 @dataclass
@@ -85,13 +134,8 @@ class AutoSpeedSingleRunTrainingArgs(AutoSpeedTrainingArgs):
     """
     config: Tuple[Path, ...] = (Path("Models/config/auto_speed.yaml"),)
     """Config YAML specifying hyperparameters for the model"""
-    profile: bool = False
+    profile: bool = True
     """Print model parameter count and FLOPs before training"""
-    output_subdir: Optional[str] = None
-    """
-    Specify an exact output directory name to write results to within runs_dir, overwriting if it already exists.
-    Otherwise a new unique subdirectory will be created
-    """
 
 
 class Logger:
@@ -202,7 +246,8 @@ def train(
     # Benefits: 10-50% speedup per epoch (amortizes ~1-2 min first-epoch compilation cost).
     # ========================================================
     uncompiled_model = model
-    if args.do_compile:
+    compile_enabled = args.do_compile or args.torch_compile
+    if compile_enabled:
         if not hasattr(torch, "compile"):
             raise RuntimeError(
                 "torch.compile is unavailable in this PyTorch version. "
@@ -254,12 +299,21 @@ def train(
 
     best = 0
     if args.fp32:
-        # Keep everything in full precision
         amp_scale = None
-        logger.write_log("FP32 training: disabling AMP and using only float32")
+        logger.write_log("Precision: FP32 (AMP disabled)")
+    elif args.bf16:
+        # BF16 has the FP32 exponent range and normally does not need scaling.
+        amp_scale = None
+        logger.write_log("Precision: BF16 automatic mixed precision")
     else:
-        # Use mixed precision with gradient scaling
-        amp_scale = torch.amp.GradScaler()
+        # Preserve the original default: FP16 AMP with gradient scaling.
+        amp_scale = torch.amp.GradScaler("cuda", enabled=True)
+        logger.write_log("Precision: FP16 automatic mixed precision with GradScaler")
+
+    logger.write_log(
+        f"TF32: {'enabled' if args.tf32 else 'disabled'} | "
+        f"torch.compile: {'enabled' if compile_enabled else 'disabled'}"
+    )
     criterion = util.ComputeLoss(model, params, vectorized=not args.disable_vectorized_loss)
 
     total_samples_all_epochs = 0
@@ -298,14 +352,12 @@ def train(
                 step = i + num_steps * epoch
                 scheduler.step(step, optimizer)
 
-                if args.fp32:
-                    samples = samples.cuda().float()
-                else:
-                    samples = samples.cuda().half()
-                samples /= 255
+                # Keep model parameters and input storage in FP32. Autocast
+                # chooses FP16/BF16 only for operations where it is safe.
+                samples = samples.cuda(non_blocking=True).float() / 255.0
 
                 # Forward
-                with contextlib.nullcontext() if args.fp32 else torch.amp.autocast('cuda'):
+                with autocast_context(args):
                     outputs = model(samples)  # forward
                     loss_box, loss_cls, loss_dfl = criterion(outputs, targets)
 
@@ -464,10 +516,8 @@ def val(args: AutoSpeedTrainingArgs, params, run_dir, model=None, log_to_stdout=
         model = torch.load(f=f'{run_dir}/weights/best.pt', map_location='cuda', weights_only=False)
         model = model['model'].float().fuse()
 
-    if args.fp32:
-        model.float()
-    else:
-        model.half()
+    # Keep validation weights in FP32 as well. Autocast controls compute dtype.
+    model.float()
     model.eval()
 
     # Configure
@@ -483,14 +533,12 @@ def val(args: AutoSpeedTrainingArgs, params, run_dir, model=None, log_to_stdout=
         loader = tqdm.tqdm(loader, desc=('%10s' * 5) % ('', 'precision', 'recall', 'mAP50', 'mAP'))
     
     for samples, targets in loader:
-        samples = samples.cuda()
-        # uint8 to fp16/32
-        samples = samples.float() if args.fp32 else samples.half()
-        samples = samples / 255.  # 0 - 255 to 0.0 - 1.0
+        samples = samples.cuda(non_blocking=True).float() / 255.0
         _, _, h, w = samples.shape  # batch-size, channels, height, width
         scale = torch.tensor((w, h, w, h)).cuda()
         # Inference
-        outputs = model(samples)
+        with autocast_context(args):
+            outputs = model(samples)
         # NMS
         outputs = util.non_max_suppression(outputs)
         # Metrics
@@ -522,16 +570,16 @@ def val(args: AutoSpeedTrainingArgs, params, run_dir, model=None, log_to_stdout=
     # Print results
     logger.write_log(('%10s' + '%10.3g' * 4) % ('', m_pre, m_rec, map50, mean_ap))
     # Return results
-    if not args.fp32:
-        # Back to full precision (from half)
-        model.float()  # for training
+    model.float()
     return mean_ap, map50, m_rec, m_pre
 
 
 def profile(args: AutoSpeedTrainingArgs, params):
     import thop
     shape = (1, 3, args.input_height, args.input_width)
-    model = AutoSpeedNetwork().build_model(version=args.version, num_classes=4)
+
+    net_builder = AutoSpeedNetwork()
+    model = net_builder.build_model(version=args.version, num_classes=4)
     model.eval()
     model(torch.zeros(shape))
 
@@ -544,16 +592,43 @@ def profile(args: AutoSpeedTrainingArgs, params):
         print(f'Number of FLOPs: {flops}')
 
 
-def new_unique_subdir(base_dir: Path, prefix: str) -> Path:
-    suffix_num = 0
-    timestamp = datetime.now().strftime("%Y-%m-%d")
+    net_builder.export_onnx(model, output_path="runs/artifacts/.onnx")
+
+
+def get_experiment_dir(runs_dir: Path, experiment_name: str) -> Path:
+    """
+    Return a unique experiment directory based on ``experiment_name``.
+
+    Examples:
+        runs/autospeed/efficientnet_lite0
+        runs/autospeed/efficientnet_lite0_2
+        runs/autospeed/efficientnet_lite0_3
+    """
+    runs_dir = Path(runs_dir)
+    experiment_name = experiment_name.strip()
+
+    if not experiment_name:
+        raise ValueError("Experiment name cannot be empty")
+
+    # Prevent --expname from containing paths such as ../folder.
+    if Path(experiment_name).name != experiment_name:
+        raise ValueError(
+            f"Invalid experiment name: '{experiment_name}'. "
+            "Use a directory name, not a path."
+        )
+
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    base_dir = runs_dir / experiment_name
+    if not base_dir.exists():
+        return base_dir
+
+    experiment_index = 2
     while True:
-        subdir_name = f"{prefix}-{timestamp}-{suffix_num:04d}"
-        subdir = base_dir / subdir_name
-        if not subdir.exists():
-            subdir.mkdir(parents=True)
-            return subdir
-        suffix_num += 1
+        candidate = runs_dir / f"{experiment_name}_{experiment_index}"
+        if not candidate.exists():
+            return candidate
+        experiment_index += 1
 
 
 if __name__ == "__main__":
@@ -562,43 +637,17 @@ if __name__ == "__main__":
     # Allow local rank and world size to be overridden by env vars
     args.local_rank = int(os.getenv('LOCAL_RANK', args.local_rank))
     args.world_size = int(os.getenv('WORLD_SIZE', args.world_size))
+    args.distributed = args.world_size > 1
+
+    configure_cuda_precision(args)
 
     # Prepare training directory
-    args.runs_dir.mkdir(exist_ok=True, parents=True)
-    if args.output_subdir is not None:
-        run_dir = args.runs_dir / args.output_subdir
-        if run_dir.exists():
-            shutil.rmtree(run_dir)
-        run_dir.mkdir(exist_ok=True)
-    else:
-        run_dir = new_unique_subdir(args.runs_dir, "run")
-    print(f"Outputting training logs and weights to {run_dir}")
+    run_dir = get_experiment_dir(
+        runs_dir=args.runs_dir,
+        experiment_name=args.expname,
+    )
+
     weights_dir = run_dir / "weights"
-    weights_dir.mkdir(exist_ok=True, parents=True)
-    log_writer = SummaryWriter(log_dir=run_dir)
-
-    if args.distributed:
-        torch.cuda.set_device(device=args.local_rank)
-        torch.distributed.init_process_group(backend='nccl', init_method='env://')
-
-    if args.local_rank == 0:
-        weights_dir.mkdir(exist_ok=True, parents=True)
-
-    # Load the hyperparameters we will pass to model training
-    params = {}
-    for config_path in args.config:
-        print(f"Loading config from {config_path}")
-        with config_path.open("r", errors="ignore") as f:
-            params.update(yaml.safe_load(f))
-
-    util.setup_seed()
-    util.setup_multi_processes()
-
-    if args.profile:
-        profile(args, params)
-    train(args, params, run_dir, log_writer)
-
-    # Clean
-    if args.distributed:
-        torch.distributed.destroy_process_group()
-    torch.cuda.empty_cache()
+    weights_dir.mkdir(parents=True, exist_ok=False)
+    log_writer = SummaryWriter(log_dir=str(run_dir))
+    

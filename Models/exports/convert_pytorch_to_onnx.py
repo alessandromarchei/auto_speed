@@ -78,7 +78,8 @@ def main():
                     output_names = ['output'],                        # output names
                     dynamic_axes={'input' : {0 : 'batch_size'},       # variable length axes
                                     'output' : {0 : 'batch_size'}},
-                    external_data=False)
+                    external_data=False,
+                    dynamo=False)
 
     # Run checks on exported FP32 ONNX network
     ONNX_network = onnx.load(onnx_model_path)
