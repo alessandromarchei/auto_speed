@@ -139,6 +139,7 @@ class AutoSpeedNetwork:
         config = self.dynamic_weighting[version]
 
         model = YOLO(
+            num_classes=num_classes,
             width=config['width'],
             depth=config['depth'],
             csp=config['csp'],
