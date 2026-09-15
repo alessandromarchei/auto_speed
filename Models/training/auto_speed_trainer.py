@@ -365,6 +365,9 @@ def train(
                 # chooses FP16/BF16 only for operations where it is safe.
                 samples = samples.cuda(non_blocking=True).float() / 255.0
 
+                #use normalization from -1 - to 1
+                samples = (samples - 0.5) * 2.0
+
                 # Forward
                 with autocast_context(args):
                     outputs = model(samples)  # forward
@@ -543,6 +546,11 @@ def val(args: AutoSpeedTrainingArgs, params, run_dir, model=None, log_to_stdout=
     
     for samples, targets in loader:
         samples = samples.cuda(non_blocking=True).float() / 255.0
+
+        #use normalization from -1 - to 1
+        samples = (samples - 0.5) * 2.0
+
+
         _, _, h, w = samples.shape  # batch-size, channels, height, width
         scale = torch.tensor((w, h, w, h)).cuda()
         # Inference
